@@ -34,11 +34,38 @@ export interface ApiError extends Error {
   code?: string;
 }
 
-export async function apiFetch<T = unknown>(
-  path: string,
-  init: RequestInit = {}
-): Promise<T> {
-  const method = init.method || 'GET';
+// Singleton in-flight refresh — collapses concurrent 401s into one rotation
+// so the rotated refresh token isn't burned twice.
+let refreshPromise: Promise<boolean> | null = null;
+
+const performRefresh = (): Promise<boolean> => {
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = (async () => {
+    try {
+      const resp = await fetch('/api/v1/auth/refresh', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'X-API-Version': '1' },
+      });
+      if (resp.ok) {
+        // Refresh rotates the csrf cookie too — invalidate the cache.
+        csrfTokenCache = null;
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    } finally {
+      // Release the lock on next microtask so all awaiters resolve first.
+      setTimeout(() => {
+        refreshPromise = null;
+      }, 0);
+    }
+  })();
+  return refreshPromise;
+};
+
+const buildHeaders = async (path: string, method: string, init: RequestInit) => {
   const headers = new Headers(init.headers);
   headers.set('X-API-Version', '1');
   if (init.body && !headers.has('Content-Type')) {
@@ -48,13 +75,35 @@ export async function apiFetch<T = unknown>(
     const token = await ensureCsrfToken();
     if (token) headers.set('X-CSRF-Token', token);
   }
+  return headers;
+};
 
-  const resp = await fetch(`/api/v1${path}`, {
-    ...init,
-    method,
-    credentials: 'include',
-    headers,
-  });
+export async function apiFetch<T = unknown>(
+  path: string,
+  init: RequestInit = {}
+): Promise<T> {
+  const method = init.method || 'GET';
+
+  const send = async () => {
+    const headers = await buildHeaders(path, method, init);
+    return fetch(`/api/v1${path}`, {
+      ...init,
+      method,
+      credentials: 'include',
+      headers,
+    });
+  };
+
+  let resp = await send();
+
+  // Auto-refresh on 401 — but only for non-auth endpoints, to avoid an infinite
+  // loop when /auth/refresh itself returns 401 (refresh token expired).
+  if (resp.status === 401 && !path.startsWith('/auth/')) {
+    const refreshed = await performRefresh();
+    if (refreshed) {
+      resp = await send();
+    }
+  }
 
   if (resp.status === 204) return undefined as T;
 
